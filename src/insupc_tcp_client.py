@@ -1,4 +1,5 @@
 import datetime
+import errno
 import itertools
 import json
 import logging
@@ -224,9 +225,9 @@ def funcDecodeHeaderMessage(byteRecvMessage, client_socket) :
         logging.info(f"""[{client_socket.getsockname()[0]}:{client_socket.getsockname()[1]}<-{client_socket.getpeername()[0]}:{client_socket.getpeername()[1]}] Receive Unknown Message : nBodyMessageLength: {nBodyMessageLength}, nMsgCode: {nMsgCode}, byteSvca: {hex(byteSvca)}, byteDvca: {hex(byteDvca)}, nAsId: {nAsId}, strSessionId: {strSessionId}, strSvcId: {strSvcId}, nResult: {nResult}, strWtime: {strWtime}, nDummy: {nDummy}""")
 
 
-    return nMsgCode, nResult, nAsId
+    return nMsgCode, nResult, nAsId, nBodyMessageLength
 
-# insupc에 query한 후 response를 수신한 data의 body를 decode하기 위한 함수. data는 전송받은 그��로 넣으면 header 62byte를 제외하고 parsing한다.
+# insupc에 query한 후 response를 수신한 data의 body를 decode하기 위한 함수. data는 전송받은 그로 넣으면 header 62byte를 제외하고 parsing한다.
 def funcDecodeQueryMessage(data):
     # 아래 두개를 return하도록 예제만듬.
     #1) = '1':1
@@ -241,17 +242,28 @@ def funcDecodeQueryMessage(data):
     #mdn_length = unpacked_mdn_length[0]
     #unpacked_mdn_number = struct.unpack(f'>{mdn_length}s', data[95:]) # 이거 95번째일수도 있음. length가 2byte아니었나? 확인 필요.
     #str_mdn_number = unpacked_mdn_number[0]
-    str_mdn_number = "025671033"
 
-    #nResult = 1 # 91번째일걸? 확인 아직 안했으므로 고정값. 그리고 일단 전체 result결과를 표시하므로 필요없음.
+    # 33 번째 byte에서 2byte로 표현된 mdn length를 unpack
+    unpacked_mdn_length = struct.unpack('>H', data[33:35])
+    mdn_length = unpacked_mdn_length[0]
 
-    #byteBodyMessage = struct.pack(f'!BBH{nParam1Length}sBH{nParam2Length}s',
+    # 35번째 byte부터 mdn_length만큼 unpack하여 전화번호 추출
+    unpacked_mdn_number = struct.unpack(f'>{mdn_length}s', data[35:35+mdn_length])
+    str_mdn_number = unpacked_mdn_number[0].decode()
+
+
     return str_mdn_number
 
 # json string 메시지를 argument로 받아서 query 결과를 response 메시지를 만들자. 
 def funcMakeQueryResponseMessage(strTransactionId, nSeq, nResult, data):
-    logging.info(f"recv query response : {data}")
-    strMdnNumber = funcDecodeQueryMessage(data)
+    # data가 있으면 strMdnNumber를 추출하자.
+    strMdnNumber = None
+    if data:
+        logging.info(f"insupc query result({nResult}), response ({data})")
+        strMdnNumber = funcDecodeQueryMessage(data)
+    # data가 없으면 strMdnNumber는 ""이다.
+    else:
+        strMdnNumber = "0"   
 
     # json형식으로 encoding 하자.
     strResponseMessage = json.dumps({
@@ -282,136 +294,198 @@ def getClientSockets():
 def recv_manager(client_socket, epoll):
     try:
         events = epoll.poll(1)
+        if not events:  # 이벤트가 없는 경우는 정상으로 처리
+            return True
+            
         for fileno, event in events:
             if fileno == client_socket.fileno():
                 if event & select.EPOLLIN:
-                    recv_data(client_socket, epoll)
-            else:
-                # 예외 처리 등 필요한 작업 수행
-                # 발생하는 케이스가 있나? 일단 로그만.
-                logging.info(f"recv_data socket error {str(e)} [{client_socket.getpeername()[0]}:{client_socket.getpeername()[1]}] / server [{client_socket.getsockname()[0]}:{client_socket.getsockname()[1]}]")
+                    return recv_data(client_socket, epoll)  # recv_data의 반환값을 그대로 전달
+                elif event & (select.EPOLLHUP | select.EPOLLERR):
+                    logging.error(f"Socket error or hangup detected")
+                    return False
     except Exception as e: 
-        with lockSocket:
-            # 소켓이 닫혔을 경우 epoll에서 제거
-            epoll.unregister(client_socket.fileno())
-            client_socket.close()
-        logging.info(f"recv_data socket error {str(e)} [{client_socket.getpeername()[0]}:{client_socket.getpeername()[1]}] / server [{client_socket.getsockname()[0]}:{client_socket.getsockname()[1]}]")
+        logging.error(f"recv_manager error: {str(e)}")
+        try:
+            with lockSocket:
+                epoll.unregister(client_socket.fileno())
+                client_socket.close()
+        except:
+            pass
+        return False
+    return True
 
 # 데이터 수신 함수
 def recv_data(client_socket, epoll):
+    global listClientInfo
     try:
-        data = client_socket.recv(1024)
-        if data:
-            # 즉시 처리할 수 있는 메시지를 처리하자.
-            nMsgCode, nResult, nAsId = funcDecodeHeaderMessage(data, client_socket)
-            if (nMsgCode == 4 or nMsgCode == 6) : # ping or access
-                #logging.info("ping 왔어요~ access message 왔어요. 로그추가 필요.")
-                # 아무것도 안하면 될듯? return
-                return
-            elif nMsgCode == 2 : # query response
-                #logging.info("query response:", data.decode()) << 일케 쓰면 안된다. err 났음. 일단 주석처리.
+        # 1. 먼저 header 62 bytes를 받는다
+        header_data = client_socket.recv(62)
+        if not header_data or len(header_data) != 62:
+            logging.error(f"Failed to receive complete header data. Received {len(header_data) if header_data else 0} bytes")
+            with lockSocket:
+                epoll.unregister(client_socket.fileno())
+                client_socket.close()
+            
+            # 연결 상태 업데이트
+            for client_info in listClientInfo:
+                if client_info["socket"] == client_socket:
+                    with lockClientInfo:
+                        client_info["connected"] = False
+                    break
+            return False
 
-                # 정석은 워커로 올려서 처리해야 하지만 
-                # 시간을 줄이기 위해 바로처리하자.
-                conn = sip_svc_tcp_server.funcGetConnection(nAsId)
-                if conn:
-                    # 아래 메시지 받은걸 넣도록 하자.
-                    strResponseMessage = funcMakeQueryResponseMessage(nAsId, nAsId, nResult, data)
+        try:
+            # 2. header 정보를 해석하고 body length도 받아온다
+            nMsgCode, nResult, nAsId, nBodyMessageLength = funcDecodeHeaderMessage(header_data, client_socket)
+        except struct.error as e:
+            logging.error(f"Failed to decode header: {str(e)}")
+            return
+
+        # 3. body message가 있으면 추가 데이터를 수신함.
+        body_data = None
+        if nBodyMessageLength > 0:
+            try:
+                body_data = b''
+                remaining = nBodyMessageLength
+                while remaining > 0:
+                    chunk = client_socket.recv(remaining)
+                    if not chunk:
+                        logging.error("Connection closed while receiving body data")
+                        break
+                    body_data += chunk
+                    remaining -= len(chunk)
+
+                if len(body_data) != nBodyMessageLength:
+                    logging.error(f"Incomplete body data. Expected {nBodyMessageLength} bytes, got {len(body_data)}")
+                    return
+            except socket.error as e:
+                logging.error(f"Socket error while receiving body: {str(e)}")
+                return
+
+        # 4. ping 또는 access 응답은 처리하지 않음
+        if (nMsgCode == 4 or nMsgCode == 6):
+            # body data length가 얼마인지만 로그로 남기자.
+            logging.info(f"access or heartbeat body data length: {nBodyMessageLength}")
+            return
+        
+        # nMsgCode == 9 인 경우는 (뭔지 모름.) 처리하지 않음.
+        if nMsgCode == 9:
+            logging.info(f"unknown message code: {nMsgCode}")
+            return
+
+        # 5. query response 처리
+        elif nMsgCode == 2:
+
+            conn = sip_svc_tcp_server.funcGetConnection(nAsId)
+            if conn:
+                try:
+                    strResponseMessage = funcMakeQueryResponseMessage(nAsId, nAsId, nResult, body_data)
                     nMessageSize = len(strResponseMessage)
-                    # (00000130) {json} << 이런식으로 만들어지도록 함.
                     strTotalMessage = "(" + str(nMessageSize).zfill(8) + ")" + strResponseMessage
                     strLocalInfo, strPeerInfo = sip_svc_tcp_server.funcGetConnectionInfo(conn)
                     logging.info(f"[{strPeerInfo}<-{strLocalInfo}] Length:{nMessageSize} Message:{strTotalMessage}")
                     conn.send(strTotalMessage.encode())
-                else: 
-                    strpeer, strlocal = sip_svc_tcp_server.funcGetConnectionInfo(conn)
-                    logging.error(f"not found sipsvc connection. so message drop. {strpeer}-{strlocal}")
-                return 
-            else :
-                logging.error("Unknown Message Received:", data.decode())
+                except Exception as e:
+                    logging.error(f"Error processing query response: {str(e)}")
+            else:
+                logging.error(f"Connection not found for AsId: {nAsId}")
+            return
         else:
-            with lockSocket:
-                # 소켓이 닫혔을 경우 epoll에서 제거
-                epoll.unregister(client_socket.fileno())
-                client_socket.close()
+            logging.error(f"Unknown Message Code: {nMsgCode}")
+
     except Exception as e:
-        logging.info(f"recv_data socket error {str(e)} ")
+        logging.error(f"recv_data socket error: {str(e)}")
+        with lockSocket:
+            epoll.unregister(client_socket.fileno())
+            client_socket.close()
+        
+        # 연결 상태 업데이트
+        for client_info in listClientInfo:
+            if client_info["socket"] == client_socket:
+                with lockClientInfo:
+                    client_info["connected"] = False
+                break
+        return False  # 연결 재시도를 위해 False 반환
+
+    return True  # 정상 처리된 경우 True 반환
 
 def client_manager(insupc_ip, insupc_port):
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.setblocking(0)
-
-    epoll = select.epoll()
-    epoll.register(client_socket.fileno(), select.EPOLLOUT)
-
-    bConnected = False
-
-    dictClientInfo = {
-        "socket": client_socket,
-        "connected": bConnected
-    }
-    global listClientInfo
-    with lockClientInfo:
-        listClientInfo.append(dictClientInfo)
-
-    # 별도의 스레드에서 recv 동작을 수행. 필요없을것같아서 일단 주석처리함.
-    #recv_thread = threading.Thread(target=recv_manager, args=(client_socket,))
-    #recv_thread.start()
-
-    # heartbeat 전송을 위한 timer를 설정하자.
-    last_heartbeat_time = time.time()
-
-    # systemID를 정하자. 귀찮으니 랜덤값으로.
-    nSystemId = random.randint(0, 255)
-
-    while True:
+    while True:  # 외부 루프
         try:
-            # 연결되어 있지 않은 상태라면 connect 시도
-            if not bConnected:
-                try :
-                    client_socket.connect((insupc_ip, insupc_port))
-                except BlockingIOError:
-                    #logging.error(f"BlockingIOError occur")
-                    pass
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_socket.setblocking(0)
 
-                events = epoll.poll(1)  # 1초 동안 대기합니다.
+            epoll = select.epoll()
+            epoll.register(client_socket.fileno(), select.EPOLLOUT)
 
-                for fileno, event in events:
-                    if fileno == client_socket.fileno() and event & select.EPOLLOUT:
-                        # 연결이 완료되었습니다.
-                        bConnected = True
-                        epoll.modify(client_socket.fileno(), select.EPOLLIN)
-                        with lockClientInfo:
-                            dictClientInfo["connected"] = bConnected
-                        logging.info(f"insupc client socket connect: client [{client_socket.getpeername()[0]}:{client_socket.getpeername()[1]}] / server [{client_socket.getsockname()[0]}:{client_socket.getsockname()[1]}]")
-                        # tcp connect 이후 access 메시지를 만들어서 전송.
-                        byteAccessMessage = funcMakeAccessMessage(nSystemId)
-                        funcSendTcp(client_socket, byteAccessMessage)
-                        logging.info(f"[{client_socket.getsockname()[0]}:{client_socket.getsockname()[1]}->{client_socket.getpeername()[0]}:{client_socket.getpeername()[1]}] Send AccessMessage")
-            else :
-                # 10초 주기로 한번씩 heartbeat
-                if time.time() - last_heartbeat_time >= 10 : 
-                    # 시간을 갱신하고
-                    last_heartbeat_time = time.time()
-                    # heartbeat 메시지를 보내자.
-                    byteHeartBeatMessage = funcMakeHearBeatMessage(nSystemId)
-                    funcSendTcp(client_socket, byteHeartBeatMessage)
-                    logging.info(f"[{client_socket.getsockname()[0]}:{client_socket.getsockname()[1]}->{client_socket.getpeername()[0]}:{client_socket.getpeername()[1]}] Send HeartBeat Message")
-                logging.info(f"current time:{time.time()} / last time: {last_heartbeat_time}")
-                
-                recv_manager(client_socket, epoll)
-                # 0.001초 interval << 필요없어보인다.
-                # time.sleep(0.001)
-        except Exception as e:
-            logging.info(f"socket error {e} {insupc_ip}:{insupc_port}")
             bConnected = False
+            dictClientInfo = {
+                "socket": client_socket,
+                "connected": bConnected
+            }
+            
             with lockClientInfo:
-                dictClientInfo["connected"] = bConnected
-            with lockSocket:
-                client_socket.close()
-            logging.info(f"insupc client socket close: {insupc_ip}:{insupc_port}")
-            time.sleep(0.1)
+                global listClientInfo
+                listClientInfo = [info for info in listClientInfo if info["socket"] != client_socket]
+                listClientInfo.append(dictClientInfo)
 
+            last_heartbeat_time = time.time()
+            nSystemId = random.randint(0, 255)
+
+            while True:  # 내부 루프
+                if not bConnected:
+                    try:
+                        client_socket.connect((insupc_ip, insupc_port))
+                    except BlockingIOError:
+                        pass
+                    except socket.error as e:
+                        if e.errno != errno.EINPROGRESS:
+                            raise
+                    
+                    events = epoll.poll(1)
+                    for fileno, event in events:
+                        if fileno == client_socket.fileno() and event & select.EPOLLOUT:
+                            bConnected = True
+                            epoll.modify(client_socket.fileno(), select.EPOLLIN)
+                            with lockClientInfo:
+                                dictClientInfo["connected"] = bConnected
+                            logging.info(f"Connected to {insupc_ip}:{insupc_port}")
+                            
+                            # 연결 성공 후 잠시 대기
+                            time.sleep(0.1)
+                            
+                            byteAccessMessage = funcMakeAccessMessage(nSystemId)
+                            funcSendTcp(client_socket, byteAccessMessage)
+                else:
+                    # heartbeat 체크
+                    current_time = time.time()
+                    if current_time - last_heartbeat_time >= 10:
+                        last_heartbeat_time = current_time
+                        try:
+                            byteHeartBeatMessage = funcMakeHearBeatMessage(nSystemId)
+                            funcSendTcp(client_socket, byteHeartBeatMessage)
+                        except Exception as e:
+                            logging.error(f"Failed to send heartbeat: {str(e)}")
+                            raise
+                    
+                    if not recv_manager(client_socket, epoll):
+                        raise Exception("Connection lost")
+                    
+                time.sleep(0.01)  # CPU 사용률 감소
+
+        except Exception as e:
+            logging.error(f"Connection error: {str(e)} for {insupc_ip}:{insupc_port}")
+            try:
+                with lockClientInfo:
+                    dictClientInfo["connected"] = False
+                with lockSocket:
+                    epoll.unregister(client_socket.fileno())
+                    client_socket.close()
+            except:
+                pass
+            
+            time.sleep(1)  # 재연결 시도 전 대기
     return
 
 def funcTestStart():

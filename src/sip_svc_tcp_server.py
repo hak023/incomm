@@ -94,55 +94,90 @@ def funcMakeQueueMessage(strRecvJsonMessage, client_ip, client_port) :
     
 # 서버에 접속된 client로부터 받은 데이터를 처리하자.
 def handle_client(conn):
-    while True:
-        try:
-            strRecvMessage = conn.recv(1024).decode('utf-8')
-            if not strRecvMessage:
-                logging.error(f"handle_client exception error. not message. {conn.getpeername()}")
+    try:
+        while True:
+            try:
+                # 먼저 메시지 길이를 읽는다 (10바이트)
+                strRecvLength = conn.recv(10).decode('utf-8')
+                if not strRecvLength:
+                    logging.info(f"Client disconnected: {conn.getpeername()}")
+                    break  # while 루프를 벗어나 연결 종료 처리로 이동
+
+                # 받은 길이 정보를 정수형으로 변환
+                try:
+                    nRecvLength = int(strRecvLength.strip('()'))
+                except ValueError:
+                    logging.error(f"Invalid length format: {strRecvLength}")
+                    continue
+
+                # 실제 메시지를 nRecvLength만큼 받는다
+                strRecvMessage = conn.recv(nRecvLength).decode('utf-8')
+                if not strRecvMessage:
+                    logging.info(f"Client disconnected while receiving message: {conn.getpeername()}")
+                    break  # while 루프를 벗어나 연결 종료 처리로 이동
+
+                client_ip = conn.getpeername()[0]
+                client_port = conn.getpeername()[1]
+                
+                # recv 메시지를 바로 logging하자.
+                logging.info(f"[{conn.getpeername()[0]}:{conn.getpeername()[1]}->{conn.getsockname()[0]}:{conn.getsockname()[1]}] {strRecvMessage}")
+
+                try:
+                    # 메시지에서 JSON 부분만 추출
+                    strRecvJsonMessage = strRecvMessage[strRecvMessage.index('{'):strRecvMessage.rindex('}')+1]
+                    logging.info(f"parsing json message >> {strRecvJsonMessage}")
+                    
+                    cmd = funcParsingJsonCommandToString(strRecvJsonMessage)
+                    # logging.info(f"command >>> {cmd}")
+                    # JSON 문자열로 command를 simple parsing하여 auth와 heartbeat의 경우 바로 응답하자.
+                    if cmd == "auth":
+                        strResponseMessage = funcMakeAuthResponseMessage(strRecvJsonMessage)
+                        logging.info(f"[{conn.getpeername()[0]}:{conn.getpeername()[1]}<-{conn.getsockname()[0]}:{conn.getsockname()[1]}] {strResponseMessage}")
+                        conn.send(strResponseMessage.encode())
+                        continue
+                    elif cmd == "hearbeat":
+                        strResponseMessage = funcMakeHeartBeatResponseMessage(strRecvJsonMessage)
+                        logging.info(f"[{conn.getpeername()[0]}:{conn.getpeername()[1]}<-{conn.getsockname()[0]}:{conn.getsockname()[1]}] {strResponseMessage}")
+                        conn.send(strResponseMessage.encode())
+                        continue
+                    elif cmd == "execute":   # 처리해야될 메시지는 worker 큐에 넣어 async 처리하자.
+                        strQueueMessage = funcMakeQueueMessage(strRecvJsonMessage, client_ip, client_port)
+                        worker.fnQueuePut(strQueueMessage)
+                        continue
+                    else :
+                        logging.error(f"....? what is this? {strRecvMessage}")
+                except ValueError:
+                    # JSON 형식이 아닌 메시지는 무시하고 다음 recv로 진행
+                    continue
+
+            except ConnectionResetError:
+                logging.info(f"Connection reset by client: {conn.getpeername()}")
                 break
+            except ConnectionAbortedError:
+                logging.info(f"Connection aborted by client: {conn.getpeername()}")
+                break
+            except Exception as e:
+                logging.error(f"handle_client exception error {e}. {conn.getpeername()} line is {traceback.format_exc()}")
+                break  # 예외 발생 시 연결 종료
 
-            client_ip = conn.getpeername()[0]
-            client_port = conn.getpeername()[1]
+    finally:
+        # 연결 종료 처리
+        try:
+            strPeerInfo = f"{conn.getpeername()[0]}:{conn.getpeername()[1]}"
+            strLocalInfo = f"{conn.getsockname()[0]}:{conn.getsockname()[1]}"
             
-            # recv 메시지를 바로 logging하자.
-            logging.info(f"[{conn.getpeername()[0]}:{conn.getpeername()[1]}->{conn.getsockname()[0]}:{conn.getsockname()[1]}] {strRecvMessage}")
-
-            # 메시지에서 JSON 부분만 추출
-            strRecvJsonMessage = strRecvMessage[strRecvMessage.index('{'):strRecvMessage.rindex('}')+1]
-            logging.info(f"parsing json message >> {strRecvJsonMessage}")
+            # connection이 close되면 list에서 삭제
+            global listConnectInfo
+            if conn in listConnectInfo:
+                with lock:
+                    listConnectInfo.remove(conn)
+                logging.info(f"Connection removed from list: client [{strPeerInfo}] / server [{strLocalInfo}]")
             
-            cmd = funcParsingJsonCommandToString(strRecvJsonMessage)
-            # logging.info(f"command >>> {cmd}")
-            # JSON 문자열로 command를 simple parsing하여 auth와 heartbeat의 경우 바로 응답하자.
-            if cmd == "auth":
-                strResponseMessage = funcMakeAuthResponseMessage(strRecvJsonMessage)
-                logging.info(f"[{conn.getpeername()[0]}:{conn.getpeername()[1]}<-{conn.getsockname()[0]}:{conn.getsockname()[1]}] {strResponseMessage}")
-                conn.send(strResponseMessage.encode())
-                continue
-            elif cmd == "hearbeat":
-                strResponseMessage = funcMakeHeartBeatResponseMessage(strRecvJsonMessage)
-                logging.info(f"[{conn.getpeername()[0]}:{conn.getpeername()[1]}<-{conn.getsockname()[0]}:{conn.getsockname()[1]}] {strResponseMessage}")
-                conn.send(strResponseMessage.encode())
-                continue
-            elif cmd == "execute":   # 처리해야될 메시지는 worker 큐에 넣어 async 처리하자.
-                strQueueMessage = funcMakeQueueMessage(strRecvJsonMessage, client_ip, client_port)
-                worker.fnQueuePut(strQueueMessage)
-                continue
-            else :
-                logging.error(f"....? what is this? {strRecvMessage}")
+            conn.close()
+            logging.info(f"Connection closed: client [{strPeerInfo}] / server [{strLocalInfo}]")
+            
         except Exception as e:
-            logging.error(f"handle_client exception error {e}. {conn.getpeername()} line is {traceback.format_exc()}")
-            break
-    logging.error(f"server Connection close: client [{conn.getpeername()[0]}:{conn.getpeername()[1]}] / server [{conn.getsockname()[0]}:{conn.getsockname()[1]}]")
-    conn.close()
-
-    # connection이 close되면 list에서 삭제한다.
-    global listConnectInfo
-    if conn in listConnectInfo :
-        with lock :
-            listConnectInfo.remove(conn)
-        logging.info(f"server listConnectInfo remove connection: client [{conn.getpeername()[0]}:{conn.getpeername()[1]}] / server [{conn.getsockname()[0]}:{conn.getsockname()[1]}]")
-    return
+            logging.error(f"Error during connection cleanup: {str(e)}")
 
 # tcp 서버에서 연결을 관리하는 manager 스레드
 def handle_manager(server_socket, nMaxConnection):
