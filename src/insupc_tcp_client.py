@@ -332,7 +332,7 @@ def recv_data(client_socket, epoll):
                 if client_info["socket"] == client_socket:
                     with lockClientInfo:
                         client_info["connected"] = False
-                    break
+                    break 
             return False
 
         try:
@@ -340,28 +340,25 @@ def recv_data(client_socket, epoll):
             nMsgCode, nResult, nAsId, nBodyMessageLength = funcDecodeHeaderMessage(header_data, client_socket)
         except struct.error as e:
             logging.error(f"Failed to decode header: {str(e)}")
-            return
+            return False
 
         # 3. body message가 있으면 추가 데이터를 수신함.
         body_data = None
         if nBodyMessageLength > 0:
             try:
-                body_data = b''
-                remaining = nBodyMessageLength
-                while remaining > 0:
+                body_data = b'' # 초기화
+                remaining = nBodyMessageLength # 남은 데이터 길이
+                while remaining > 0: # 데이터가 남아있으면 계속 수신함.
                     chunk = client_socket.recv(remaining)
                     if not chunk:
                         logging.error("Connection closed while receiving body data")
-                        break
+                        return False
                     body_data += chunk
-                    remaining -= len(chunk)
+                    remaining -= len(chunk) # 남은 데이터 길이 갱신
 
-                if len(body_data) != nBodyMessageLength:
-                    logging.error(f"Incomplete body data. Expected {nBodyMessageLength} bytes, got {len(body_data)}")
-                    return
             except socket.error as e:
                 logging.error(f"Socket error while receiving body: {str(e)}")
-                return
+                return False
 
         # 4. ping 또는 access 응답은 처리하지 않음
         if (nMsgCode == 4 or nMsgCode == 6):
@@ -390,7 +387,6 @@ def recv_data(client_socket, epoll):
                     logging.error(f"Error processing query response: {str(e)}")
             else:
                 logging.error(f"Connection not found for AsId: {nAsId}")
-            return
         else:
             logging.error(f"Unknown Message Code: {nMsgCode}")
 
@@ -434,7 +430,7 @@ def client_manager(insupc_ip, insupc_port):
             nSystemId = random.randint(0, 255)
 
             while True:  # 내부 루프
-                if not bConnected:
+                if not bConnected: 
                     try:
                         client_socket.connect((insupc_ip, insupc_port))
                     except BlockingIOError:
