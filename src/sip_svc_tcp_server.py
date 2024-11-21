@@ -125,7 +125,7 @@ def handle_client(conn):
                 try:
                     # 메시지에서 JSON 부분만 추출
                     strRecvJsonMessage = strRecvMessage[strRecvMessage.index('{'):strRecvMessage.rindex('}')+1]
-                    logging.info(f"parsing json message >> {strRecvJsonMessage}")
+                    #logging.info(f"parsing json message >> {strRecvJsonMessage}")
                     
                     cmd = funcParsingJsonCommandToString(strRecvJsonMessage)
                     # logging.info(f"command >>> {cmd}")
@@ -216,6 +216,8 @@ def handle_manager(server_socket, nMaxConnection):
 
 def fnStart(strServerIp, nServerPort, nMaxConnection):
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # SO_REUSEADDR 옵션 설정
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((strServerIp, nServerPort))
     server_socket.listen(nMaxConnection)
     logging.info(f"Server Listening on {strServerIp}:{nServerPort} and waiting client.")

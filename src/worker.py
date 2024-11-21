@@ -115,7 +115,16 @@ def fnWorkerProcess(strMessage, nQueueThreadNumber):
     # 메시지를 만들자
     client_socket = getClientSockets()
     if (client_socket) :
-        funcSendTcp(client_socket, byteQueryMessage)
+        # tcp 메시지를 보내고 client_socket을 기반으로 로그를 남기자. tcp send 결과를 남겨야한다.
+        bSendResult = funcSendTcp(client_socket, byteQueryMessage)  
+        if (bSendResult) :
+            # client_socket으로 peer에 대한 정보를 로그로 남기자.
+            strPeerInfo = client_socket.getpeername()
+            # client_socket으로 local에 대한 정보를 로그로 남기자.
+            strLocalInfo = client_socket.getsockname()
+            #logging.info(f"{strLogPrefix} [{strLocalInfo} -> {strPeerInfo}] {byteQueryMessage}")
+        else :
+            logging.error(f"{strLogPrefix} [{strLocalInfo} -> {strPeerInfo}] Send {byteQueryMessage} failed.")
     else :
         logging.error(f"error. not found client_socket by workerprocess. ")
 
