@@ -16,38 +16,79 @@ def getCdrLogInstance():
     return cdr_logging
 """
 
+def setup_logging(log_path, log_name, max_size_mb=300):
+    current_date = datetime.date.today()
+    log_count = 1
+    
+    def get_log_file_path():
+        return os.path.join(log_path, f"{log_name}.{current_date}.{log_count}")
+    
+    def check_log_size(file_path):
+        if os.path.exists(file_path):
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)  # Convert to MB
+            return size_mb > max_size_mb
+        return False
+    
+    def get_next_log_file():
+        nonlocal log_count
+        while check_log_size(get_log_file_path()):
+            log_count += 1
+        return get_log_file_path()
+    
+    class DailyRotatingHandler(logging.FileHandler):
+        def __init__(self, filename, mode='a', encoding=None):
+            self.base_filename = filename
+            super().__init__(filename, mode, encoding)
+            
+        def emit(self, record):
+            try:
+                if self.check_new_day() or check_log_size(self.baseFilename):
+                    self.baseFilename = get_next_log_file()
+                    if self.stream:
+                        self.stream.close()
+                    self.stream = self._open()
+                logging.FileHandler.emit(self, record)
+            except Exception:
+                self.handleError(record)
+                
+        def check_new_day(self):
+            nonlocal current_date
+            today = datetime.date.today()
+            if today != current_date:
+                current_date = today
+                global log_count
+                log_count = 1
+                return True
+            return False
+    
+    if not os.path.exists(log_path):
+        os.makedirs(log_path)
+        
+    log_file = get_next_log_file()
+    handler = DailyRotatingHandler(log_file)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # 기존 핸들러 제거
+    for hdlr in logger.handlers[:]:
+        logger.removeHandler(hdlr)
+    
+    logger.addHandler(handler)
+    return logger
+
 def main():
     config.fnLoadConfig()
     dictConfig = config.fnGetConfig()
     log_name = dictConfig['log_name']
     log_path = dictConfig['log_path']
-
-    # log path make
-    if not os.path.exists(log_path):
-        os.makedirs(log_path)
-    current_date = datetime.date.today()
-    full_log_path = os.path.join(log_path, log_name + '.' + str(current_date))
-
-    # 로그 생성
-    logging.basicConfig(filename=full_log_path, 
-                        level=logging.INFO,
-                        format='%(asctime)s - %(levelname)s - %(message)s')
     
-    logging.info("Process Start %s", log_name)
-
-    """
-    # CDR 로그생성.
-    global cdr_logging
-    cdr_log_path = os.path.join(log_path, "cdr" + '.' + str(current_date))
-    cdr_logging = logging.getLogger("cdr_logging")
-    cdr_log_handler = logging.FileHandler(cdr_log_path)
-    cdr_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    cdr_log_handler.setFormatter(cdr_formatter)
-    cdr_logging.addHandler(cdr_log_handler)
-    getCdrLogInstance(log_path, current_date)
-    cdr_logging.info("Process Start %s", log_name)
-    """
-
+    # 로깅 설정
+    logger = setup_logging(log_path, log_name)
+    logger.info("Process Start %s", log_name)
+    
     # worker setting
     worker_number = dictConfig['worker_number']
     worker.fnStart(int(worker_number))
